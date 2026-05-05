@@ -1,5 +1,9 @@
 # Steam Deck (desktop) — playbook
 
+[![CI](https://github.com/alexcmd/windows-on-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/alexcmd/windows-on-linux/actions/workflows/ci.yml)
+[![Release](https://github.com/alexcmd/windows-on-linux/actions/workflows/release.yml/badge.svg)](https://github.com/alexcmd/windows-on-linux/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/alexcmd/windows-on-linux)](https://github.com/alexcmd/windows-on-linux/releases/latest)
+
 Runnable notes for installing and launching Windows / native Linux games
 on a Steam Deck in desktop mode, outside the Steam client.
 
