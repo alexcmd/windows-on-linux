@@ -171,7 +171,7 @@ done
 hdr "PATH"
 
 if [[ ":${PATH}:" == *":${BIN_DST}:"* ]]; then
-    ok "~/.local/bin already in PATH"
+    ok "$HOME/.local/bin already in PATH"
 else
     PROFILE_FILE=""
     for f in "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile"; do

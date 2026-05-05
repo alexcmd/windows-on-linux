@@ -133,10 +133,9 @@ discover_games() {
 # walk up to the install root and look for a bundled Linux launcher.
 # Prints the launcher path, or nothing if none.
 find_native_launcher() {
-    local exe="$1" bin_dir root arch candidates
+    local exe="$1" bin_dir arch
     bin_dir=$(dirname "$(dirname "$exe")")  # typically …/bin
     case "$bin_dir" in */bin|*/Bin|*/BIN) ;; *) return 0;; esac
-    root=$(dirname "$bin_dir")
     arch="x86_64"; [ "$(uname -m)" = "i686" ] && arch="x86"
     # Preferred order: same-arch > x86_64 > x86, launch.sh > native bin
     for sub in "linux-$arch" linux-x86_64 linux-x86 linux; do
@@ -233,7 +232,8 @@ create_desktop_shortcut() {
     local safe_name
     safe_name=$(echo "$name" | tr ' /:' '---' | tr -cd 'A-Za-z0-9._-')
 
-    local desktop_entry="[Desktop Entry]
+    local desktop_entry
+    desktop_entry="[Desktop Entry]
 Type=Application
 Version=1.0
 Name=$name
