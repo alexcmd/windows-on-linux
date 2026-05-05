@@ -1,9 +1,9 @@
-# Maintainer: sdeck contributors <https://github.com/USER/sdeck>
+# Maintainer: sdeck contributors <https://github.com/alexcmd/windows-on-linux>
 pkgname=sdeck
 pkgver=0.0.0
 pkgrel=0
 pkgdesc="Proton wrapper tools for running Windows .exe files on Linux"
-url="https://github.com/USER/sdeck"
+url="https://github.com/alexcmd/windows-on-linux"
 arch="noarch"
 license="MIT"
 depends="bash python3 curl xdg-utils"
