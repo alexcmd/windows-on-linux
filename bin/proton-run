@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# proton-run — Run Windows .exe files through Steam's Proton without
+# launching the Steam client. Mirrors the container/runtime setup Steam
+# normally does (Steam Linux Runtime "sniper" + pressure-vessel + Proton).
+#
+# Usage:
+#   proton-run [OPTIONS] <path/to/app.exe> [app args...]
+#   proton-run [OPTIONS] --winecfg | --regedit | --shell | --kill
+#   proton-run --list
+#
+# Options:
+#   -p, --prefix NAME       Prefix name under steamapps/compatdata/
+#                           (default: proton-run). Can be any string or a
+#                           numeric Steam AppID to reuse an existing prefix.
+#   -P, --proton VERSION    Proton dir name under steamapps/common/, e.g.
+#                           "Proton 10.0" (default), or an absolute path.
+#                           Also checks compatibilitytools.d/ for Proton-GE.
+#   -v, --verb VERB         Proton verb: run | runinprefix | waitforexitandrun
+#                           (default: waitforexitandrun).
+#   -n, --no-runtime        Skip the Steam Linux Runtime sniper container.
+#   -l, --list              List installed Proton versions and existing prefixes.
+#   -g, --games             List installed games discovered across prefixes.
+#   -r, --run NAME          Launch a previously-installed game by short name
+#                           (substring match of its display name, case-insensitive).
+#                           Prefers the native Linux build if one is bundled
+#                           with the game (e.g. bin/linux-x86/launch.sh);
+#                           falls back to Proton with the Windows .exe.
+#   --force-proton          With --run, ignore any native Linux binary and
+#                           launch the Windows .exe through Proton.
+#
+#   --desktop               Create a .desktop shortcut on Desktop + app launcher.
+#   --steam [TOOL]          Add to Steam library as a non-Steam game. Optional
+#                           TOOL sets Proton version (e.g. proton_10). Requires
+#                           Steam to be closed. Uses steam-shortcut helper.
+#   --name NAME             Display name for --desktop / --steam (default:
+#                           derived from the .exe filename).
+#   --icon PATH             Icon file for --desktop / --steam (PNG or ICO).
+#
+#   -h, --help              Show this help.
+#
+# Environment overrides (optional):
+#   STEAM_ROOT            Default: ~/.local/share/Steam
+#   PROTON_LOG=1          Write $STEAM_COMPAT_DATA_PATH/steam-*.log
+#   WINEDLLOVERRIDES      Forwarded to Wine as-is.
+#   Any PROTON_* / WINE* / DXVK_* / VKD3D_* vars are inherited.
+#
+# Examples:
+#   proton-run ~/Downloads/Npp.8.6.Installer.x64.exe
+#   proton-run -p warcraft3 "/run/media/deck/CDs/.../setup.exe"
+#   proton-run -p warcraft3 --winecfg
+#   proton-run -p warcraft3 'C:\Program Files (x86)\Warcraft III\Warcraft III.exe'
+#   proton-run -p warcraft3 --kill
+#
+#   # Add to Desktop + Steam library in one shot:
+#   proton-run -p mygame --desktop --steam proton_10 \
+#       --name "My Game" --icon ~/icon.png ~/game/game.exe
+#
+#   # List installed games, then launch one by a fragment of its name:
+#   proton-run --games
+#   proton-run --run neverwinter
+#
+set -euo pipefail
+
+STEAM_ROOT="${STEAM_ROOT:-$HOME/.local/share/Steam}"
+DEFAULT_PROTON="Proton 10.0"
+DEFAULT_PREFIX="proton-run"
+DEFAULT_VERB="waitforexitandrun"
+
+die()  { printf 'proton-run: %s\n' "$*" >&2; exit 1; }
+info() { printf 'proton-run: %s\n' "$*" >&2; }
+
+usage() {
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0"
+}
+
+list_versions() {
+    echo "Installed Proton versions:"
+    echo
+    echo "  Official (Steam-managed, in $STEAM_ROOT/steamapps/common):"
+    shopt -s nullglob
+    for d in "$STEAM_ROOT/steamapps/common/"Proton*; do
+        [ -x "$d/proton" ] && echo "    - $(basename "$d")"
+    done
+    echo
+    echo "  Custom / Proton-GE (in $STEAM_ROOT/compatibilitytools.d):"
+    local found=0
+    for d in "$STEAM_ROOT/compatibilitytools.d"/*/; do
+        [ -f "${d}proton" ] && { echo "    - $(basename "$d")"; found=1; }
+    done
+    [ $found -eq 0 ] && echo "    (none — install with: proton-install get)"
+    echo
+    echo "Existing prefixes (in $STEAM_ROOT/steamapps/compatdata):"
+    for d in "$STEAM_ROOT/steamapps/compatdata"/*/; do
+        [ -d "${d}pfx" ] && echo "    - $(basename "$d")"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Game discovery (reads proton_shortcuts/ created by Windows installers)
+# ---------------------------------------------------------------------------
+# Emits one line per game: short|display_name|prefix|abs_path_to_exe|native_launcher_or_empty
+discover_games() {
+    shopt -s nullglob
+    local compatdata="$STEAM_ROOT/steamapps/compatdata"
+    local prefix_dir prefix shortcut name path_line wmclass exe short native
+    for prefix_dir in "$compatdata"/*/pfx/drive_c; do
+        [ -d "$prefix_dir/proton_shortcuts" ] || continue
+        prefix="$(basename "$(dirname "$(dirname "$prefix_dir")")")"
+        for shortcut in "$prefix_dir/proton_shortcuts"/*.desktop; do
+            name=$(sed -n 's/^Name=//p' "$shortcut" | head -1)
+            case "$name" in
+                ''|*[Uu]ninstall*|*Удалить*|*удалить*|*Désinstall*|*Deinstall*) continue;;
+            esac
+            path_line=$(sed -n 's/^Path=//p' "$shortcut" | head -1)
+            wmclass=$(sed -n 's/^StartupWMClass=//p' "$shortcut" | head -1)
+            exe=""
+            if [ -n "$path_line" ] && [ -n "$wmclass" ] && [ -f "$path_line/$wmclass" ]; then
+                exe="$path_line/$wmclass"
+            elif [ -n "$path_line" ] && [ -d "$path_line" ]; then
+                exe=$(find "$path_line" -maxdepth 1 -type f -iname "*.exe" \
+                      ! -iname "unins*" ! -iname "*uninstall*" 2>/dev/null | head -1)
+            fi
+            [ -n "$exe" ] && [ -f "$exe" ] || continue
+            native=$(find_native_launcher "$exe")
+            short=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' \
+                    | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')
+            printf '%s|%s|%s|%s|%s\n' "$short" "$name" "$prefix" "$exe" "$native"
+        done
+    done
+}
+
+# Given a Windows exe under a GOG-style install (…/bin/win32/foo.exe),
+# walk up to the install root and look for a bundled Linux launcher.
+# Prints the launcher path, or nothing if none.
+find_native_launcher() {
+    local exe="$1" bin_dir root arch candidates
+    bin_dir=$(dirname "$(dirname "$exe")")  # typically …/bin
+    case "$bin_dir" in */bin|*/Bin|*/BIN) ;; *) return 0;; esac
+    root=$(dirname "$bin_dir")
+    arch="x86_64"; [ "$(uname -m)" = "i686" ] && arch="x86"
+    # Preferred order: same-arch > x86_64 > x86, launch.sh > native bin
+    for sub in "linux-$arch" linux-x86_64 linux-x86 linux; do
+        local d="$bin_dir/$sub"
+        [ -d "$d" ] || continue
+        if [ -x "$d/launch.sh" ] || [ -f "$d/launch.sh" ]; then
+            printf '%s\n' "$d/launch.sh"; return 0
+        fi
+        for cand in "$d"/*-linux "$d"/*.x86_64 "$d"/*.x86; do
+            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        done
+    done
+    return 0
+}
+
+list_games() {
+    local games short name prefix exe native kind
+    games=$(discover_games)
+    if [ -z "$games" ]; then
+        echo "No games discovered. (Scans proton_shortcuts/ in each prefix.)"
+        echo "Prefixes checked: $STEAM_ROOT/steamapps/compatdata/*/"
+        return 0
+    fi
+    printf '%-34s %-16s %-8s %s\n' "SHORT NAME" "PREFIX" "RUNTIME" "DISPLAY NAME"
+    printf '%.0s-' $(seq 1 100); echo
+    while IFS='|' read -r short name prefix exe native; do
+        kind="proton"; [ -n "$native" ] && kind="native"
+        printf '%-34s %-16s %-8s %s\n' "$short" "$prefix" "$kind" "$name"
+    done <<<"$games"
+    echo
+    echo "Launch with: proton-run --run <short-name>"
+    echo "Force Proton even when native exists: proton-run --run <name> --force-proton"
+}
+
+# Sets PREFIX and either _RUN_EXE (for Proton) or _NATIVE_EXE (for direct exec).
+resolve_game_by_name() {
+    local query="$1" games matches count short name prefix exe native
+    games=$(discover_games)
+    [ -n "$games" ] || die "no games found (scanned $STEAM_ROOT/steamapps/compatdata/*/pfx/drive_c/proton_shortcuts)"
+    matches=$(printf '%s\n' "$games" | awk -F'|' -v q="$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')" '
+        BEGIN{IGNORECASE=1}
+        { s=tolower($1); n=tolower($2); p=tolower($3);
+          if (index(s,q) || index(n,q) || index(p,q)) print }
+    ')
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [ "$count" -eq 0 ]; then
+        die "no game matches '$query' (try: proton-run --games)"
+    fi
+    if [ "$count" -gt 1 ]; then
+        echo "proton-run: multiple matches for '$query':" >&2
+        printf '%s\n' "$matches" | awk -F'|' '{printf "  - %-30s  %s (prefix=%s)\n", $1, $2, $3}' >&2
+        die "be more specific"
+    fi
+    IFS='|' read -r short name prefix exe native <<<"$matches"
+    PREFIX="$prefix"
+    if [ -n "$native" ] && [ "$FORCE_PROTON" != "1" ]; then
+        _NATIVE_EXE="$native"
+        info "Launching: $name  (native Linux binary)"
+    else
+        _RUN_EXE="$exe"
+        info "Launching: $name  (Proton, prefix=$prefix)"
+    fi
+}
+
+resolve_proton() {
+    local ver="$1"
+    # 1. Absolute path
+    if [ -d "$ver" ] && [ -x "$ver/proton" ]; then
+        echo "$ver"; return 0
+    fi
+    # 2. Steam common
+    local d="$STEAM_ROOT/steamapps/common/$ver"
+    if [ -x "$d/proton" ]; then
+        echo "$d"; return 0
+    fi
+    # 3. compatibilitytools.d (Proton-GE etc)
+    d="$STEAM_ROOT/compatibilitytools.d/$ver"
+    if [ -x "$d/proton" ] || [ -f "$d/proton" ]; then
+        echo "$d"; return 0
+    fi
+    # 4. Fuzzy match in compatibilitytools.d
+    shopt -s nullglob
+    for d in "$STEAM_ROOT/compatibilitytools.d"/*"$ver"*; do
+        [ -f "$d/proton" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Desktop shortcut creation
+# ---------------------------------------------------------------------------
+create_desktop_shortcut() {
+    local exe="$1" name="$2" icon="$3" prefix="$4" proton_ver="$5"
+    local safe_name
+    safe_name=$(echo "$name" | tr ' /:' '---' | tr -cd 'A-Za-z0-9._-')
+
+    local desktop_entry="[Desktop Entry]
+Type=Application
+Version=1.0
+Name=$name
+Comment=Windows app launched via Proton ($proton_ver)
+Exec=$(command -v proton-run || readlink -f "$0") -p $prefix -P \"$proton_ver\" \"$exe\"
+Path=$(dirname "$exe")
+Icon=$icon
+Terminal=false
+StartupNotify=true
+Categories=Game;
+Keywords=$(echo "$safe_name" | tr '-' ';');"
+
+    # App launcher
+    local app_dir="$HOME/.local/share/applications"
+    mkdir -p "$app_dir"
+    local app_file="$app_dir/${safe_name}.desktop"
+    printf '%s\n' "$desktop_entry" > "$app_file"
+    chmod +x "$app_file"
+
+    # Desktop
+    local desktop_dir="$HOME/Desktop"
+    if [ -d "$desktop_dir" ]; then
+        local desk_file="$desktop_dir/${safe_name}.desktop"
+        cp "$app_file" "$desk_file"
+        chmod +x "$desk_file"
+        # KDE: mark as trusted
+        gio set -t string "$desk_file" metadata::trusted true 2>/dev/null || true
+        info "Desktop shortcut: $desk_file"
+    fi
+
+    # Refresh menu
+    update-desktop-database "$app_dir" 2>/dev/null || true
+    info "App launcher:    $app_file"
+}
+
+# ---------------------------------------------------------------------------
+# Steam library shortcut creation
+# ---------------------------------------------------------------------------
+add_to_steam() {
+    local exe="$1" name="$2" icon="$3" tool="$4" prefix="$5" proton_ver="$6"
+
+    # We add proton-run as the Exe so Steam doesn't double-wrap with its own
+    # Proton; the compat tool is set only if --steam <TOOL> was given AND
+    # the exe is the raw .exe (not wrapped by proton-run).
+    #
+    # Strategy: add proton-run as the launcher, with the game exe + prefix
+    # baked into launch options. This way it works even without Steam's
+    # Proton assignment (standalone mode).
+    local wrapper; wrapper=$(command -v proton-run || readlink -f "$0")
+    local launch_opts="-p $prefix -P \"$proton_ver\" \"$exe\""
+
+    local steam_args=(
+        --name "$name"
+        --exe "$wrapper"
+        --launch-options "$launch_opts"
+    )
+    [ -n "$icon" ] && steam_args+=(--icon "$icon")
+    [ -n "$tool" ] && steam_args+=(--tool "$tool")
+
+    if command -v steam-shortcut >/dev/null 2>&1; then
+        steam-shortcut add "${steam_args[@]}"
+    else
+        die "steam-shortcut not found in PATH. Install it to ~/.local/bin/"
+    fi
+}
+
+# --- parse args ---------------------------------------------------------------
+PREFIX="$DEFAULT_PREFIX"
+PROTON_VER="$DEFAULT_PROTON"
+VERB="$DEFAULT_VERB"
+USE_RUNTIME=1
+ACTION=""
+ADD_DESKTOP=0
+ADD_STEAM=0
+STEAM_TOOL=""
+DISPLAY_NAME=""
+ICON_PATH=""
+RUN_BY_NAME=""
+FORCE_PROTON=0
+_RUN_EXE=""
+_NATIVE_EXE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--prefix)     PREFIX="$2"; shift 2;;
+        -P|--proton)     PROTON_VER="$2"; shift 2;;
+        -v|--verb)       VERB="$2"; shift 2;;
+        -n|--no-runtime) USE_RUNTIME=0; shift;;
+        -l|--list)       list_versions; exit 0;;
+        -g|--games)      list_games; exit 0;;
+        -r|--run)        RUN_BY_NAME="$2"; shift 2;;
+        --force-proton)  FORCE_PROTON=1; shift;;
+        -h|--help)       usage; exit 0;;
+        --winecfg)       ACTION="winecfg"; shift;;
+        --regedit)       ACTION="regedit"; shift;;
+        --shell)         ACTION="shell";   shift;;
+        --kill)          ACTION="kill";    shift;;
+        --desktop)       ADD_DESKTOP=1; shift;;
+        --steam)
+            ADD_STEAM=1
+            # Next arg may be the compat tool name or another flag
+            if [ "${2:-}" != "" ] && [[ ! "${2:-}" =~ ^- ]]; then
+                STEAM_TOOL="$2"; shift 2
+            else
+                shift
+            fi
+            ;;
+        --name)          DISPLAY_NAME="$2"; shift 2;;
+        --icon)          ICON_PATH="$2"; shift 2;;
+        --)              shift; break;;
+        -*)              die "unknown option: $1 (see --help)";;
+        *)               break;;
+    esac
+done
+
+# --- resolve game by short name (may set PREFIX + _RUN_EXE or _NATIVE_EXE) ---
+if [ -n "$RUN_BY_NAME" ]; then
+    resolve_game_by_name "$RUN_BY_NAME"
+fi
+
+# --- native Linux launch short-circuit (no Proton/runtime) -------------------
+if [ -n "$_NATIVE_EXE" ]; then
+    chmod +x "$_NATIVE_EXE" 2>/dev/null || true
+    cd "$(dirname "$_NATIVE_EXE")"
+    exec "$_NATIVE_EXE" "$@"
+fi
+
+# --- resolve Proton -----------------------------------------------------------
+PROTON_DIR=$(resolve_proton "$PROTON_VER") || \
+    die "Proton not found: $PROTON_VER  (try: proton-run --list)"
+
+# --- resolve prefix -----------------------------------------------------------
+COMPAT_DATA="$STEAM_ROOT/steamapps/compatdata/$PREFIX"
+mkdir -p "$COMPAT_DATA"
+
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT"
+export STEAM_COMPAT_DATA_PATH="$COMPAT_DATA"
+export STEAM_COMPAT_APP_ID="${STEAM_COMPAT_APP_ID:-0}"
+export SteamAppId="${SteamAppId:-0}"
+export SteamGameId="${SteamGameId:-0}"
+
+# --- built-in actions ---------------------------------------------------------
+case "$ACTION" in
+    kill)
+        WINEPREFIX="$COMPAT_DATA/pfx" \
+            "$PROTON_DIR/files/bin/wineserver" -k || true
+        exit 0
+        ;;
+    winecfg) set -- "winecfg.exe";;
+    regedit) set -- "regedit.exe";;
+    shell)   set -- "wineconsole.exe" "cmd.exe";;
+esac
+
+if [ -n "$_RUN_EXE" ]; then
+    EXE="$_RUN_EXE"
+else
+    [ $# -gt 0 ] || { usage; exit 1; }
+    # First positional is the target; the rest are its args.
+    EXE="$1"; shift
+    if [ -e "$EXE" ]; then
+        EXE="$(readlink -f "$EXE")"
+    fi
+fi
+
+# --- derive display name if not set -------------------------------------------
+if [ -z "$DISPLAY_NAME" ]; then
+    # Strip path, extension, and common suffixes
+    DISPLAY_NAME="$(basename "$EXE" .exe)"
+    DISPLAY_NAME="$(basename "$DISPLAY_NAME" .EXE)"
+    # Replace underscores/dashes with spaces for readability
+    DISPLAY_NAME="${DISPLAY_NAME//_/ }"
+    DISPLAY_NAME="${DISPLAY_NAME//-/ }"
+fi
+
+# --- create shortcuts if requested (before exec) -----------------------------
+if [ "$ADD_DESKTOP" -eq 1 ]; then
+    create_desktop_shortcut "$EXE" "$DISPLAY_NAME" "$ICON_PATH" "$PREFIX" "$PROTON_VER"
+fi
+
+if [ "$ADD_STEAM" -eq 1 ]; then
+    add_to_steam "$EXE" "$DISPLAY_NAME" "$ICON_PATH" "$STEAM_TOOL" "$PREFIX" "$PROTON_VER"
+fi
+
+# If we only wanted to create shortcuts (no actual launch), allow exit
+if { [ "$ADD_DESKTOP" -eq 1 ] || [ "$ADD_STEAM" -eq 1 ]; } && \
+   [ "${PROTON_RUN_NO_LAUNCH:-0}" = "1" ]; then
+    info "Shortcuts created. Set PROTON_RUN_NO_LAUNCH=0 or omit it to also launch."
+    exit 0
+fi
+
+# --- launch -------------------------------------------------------------------
+RUNTIME_ENTRY="$STEAM_ROOT/steamapps/common/SteamLinuxRuntime_sniper/_v2-entry-point"
+
+if [ "$USE_RUNTIME" = 1 ] && [ -x "$RUNTIME_ENTRY" ]; then
+    exec "$RUNTIME_ENTRY" --verb="$VERB" -- \
+        "$PROTON_DIR/proton" "$VERB" "$EXE" "$@"
+else
+    exec "$PROTON_DIR/proton" "$VERB" "$EXE" "$@"
+fi

@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Alpine APK
+  # ---------------------------------------------------------------------------
+  build-apk:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: apk add --no-cache alpine-sdk git
+
+      - name: Set up build user
+        run: |
+          adduser -D builder
+          addgroup builder abuild
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Generate ephemeral signing key
+        run: su builder -c "abuild-keygen -a -n"
+
+      - name: Patch APKBUILD
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
+          cp packaging/alpine/APKBUILD /tmp/APKBUILD
+          sed -i \
+            -e "s|^pkgver=.*|pkgver=${VERSION}|" \
+            -e "s|https://github.com/USER/sdeck|${REPO_URL}|" \
+            -e "s|sdeck-\$pkgver|${REPO_NAME}-\$pkgver|g" \
+            /tmp/APKBUILD
+
+          chown builder:builder /tmp/APKBUILD
+
+      - name: Fill checksum and build
+        run: |
+          mkdir -p /home/builder/packages
+          chown -R builder:builder /home/builder/packages
+
+          su builder -c "
+            export PKGDEST=/home/builder/packages
+            export SRCDEST=/home/builder/srcdest
+            mkdir -p \$SRCDEST
+            cd /tmp
+            abuild checksum
+            abuild -F
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpine-apk
+          path: /home/builder/packages/**/*.apk
+
+  # ---------------------------------------------------------------------------
+  # Flatpak bundle
+  # ---------------------------------------------------------------------------
+  build-flatpak:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --noninteractive flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08
+
+      - name: Build Flatpak bundle
+        run: |
+          flatpak-builder \
+            --repo=flatpak-repo \
+            --force-clean \
+            flatpak-build \
+            packaging/flatpak/org.sdeck.ProtonRun.yml
+
+          flatpak build-bundle \
+            flatpak-repo \
+            sdeck.flatpak \
+            org.sdeck.ProtonRun
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: sdeck.flatpak
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [build-apk, build-flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            **/*.apk
+            sdeck.flatpak

@@ -1,0 +1,29 @@
+# Maintainer: sdeck contributors <https://github.com/USER/sdeck>
+pkgname=sdeck
+pkgver=0.0.0
+pkgrel=0
+pkgdesc="Proton wrapper tools for running Windows .exe files on Linux"
+url="https://github.com/USER/sdeck"
+arch="noarch"
+license="MIT"
+depends="bash python3 curl xdg-utils"
+
+# Source is the GitHub release tarball.
+# pkgver and sha256sums are patched by the release CI workflow.
+source="$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+builddir="$srcdir/sdeck-$pkgver"
+
+# sha256sums is filled by: abuild checksum
+sha256sums=""
+
+build() {
+    : # nothing to compile
+}
+
+package() {
+    install -Dm755 bin/proton-run     "$pkgdir/usr/bin/proton-run"
+    install -Dm755 bin/proton-install  "$pkgdir/usr/bin/proton-install"
+    install -Dm755 bin/steam-shortcut  "$pkgdir/usr/bin/steam-shortcut"
+    install -Dm755 install.sh          "$pkgdir/usr/share/$pkgname/install.sh"
+    install -Dm644 README.md           "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,26 @@
+app-id: org.sdeck.ProtonRun
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: proton-run
+
+# CLI tool — all binaries in /app/bin/ are accessible via:
+#   flatpak run org.sdeck.ProtonRun [args]          (proton-run)
+#   flatpak run --command=proton-install org.sdeck.ProtonRun [args]
+#   flatpak run --command=steam-shortcut org.sdeck.ProtonRun [args]
+
+finish-args:
+  - --share=network          # proton-install downloads Proton-GE
+  - --filesystem=home        # Steam dir + game files live under $HOME
+  - --socket=system-bus      # Steam IPC
+
+modules:
+  - name: sdeck
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/proton-run     /app/bin/proton-run
+      - install -Dm755 bin/proton-install  /app/bin/proton-install
+      - install -Dm755 bin/steam-shortcut  /app/bin/steam-shortcut
+    sources:
+      - type: dir
+        path: ../..

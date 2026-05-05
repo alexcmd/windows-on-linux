@@ -1,0 +1,14 @@
+# editors
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

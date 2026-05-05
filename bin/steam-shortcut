@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""steam-shortcut — Manage Steam non-Steam game shortcuts from the CLI.
+
+Reads and writes the binary VDF shortcuts.vdf file and the text-mode
+config.vdf (for Proton/compat tool assignment).
+
+Usage:
+    steam-shortcut list
+    steam-shortcut add   --name NAME --exe EXE [options]
+    steam-shortcut remove --name NAME | --appid APPID
+    steam-shortcut set-compat --appid APPID --tool TOOL
+    steam-shortcut clear-compat --appid APPID          # drop any Proton mapping
+    steam-shortcut grid   --appid APPID --steam-appid STEAM_APPID
+                                                       # download official art
+    steam-shortcut appid  --name NAME --exe EXE   # print computed appid
+
+Options for 'add':
+    --name NAME           Display name in the Steam library
+    --exe  EXE            Target executable (quoted paths supported)
+    --startdir DIR        Working directory (default: exe's parent dir)
+    --icon PATH           Icon file path (PNG/ICO)
+    --launch-options OPTS Extra launch options / %command% string
+    --tags TAG[,TAG,...]  Comma-separated collection tags
+    --hidden              Mark as hidden in library
+    --tool TOOL           Proton compat tool (e.g. proton_10, proton_9)
+
+Requires Steam to be CLOSED when writing (Steam overwrites on exit).
+"""
+
+import argparse
+import os
+import struct
+import sys
+import time
+import zlib
+from collections import OrderedDict
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+STEAM_ROOT = Path(os.environ.get("STEAM_ROOT", Path.home() / ".local/share/Steam"))
+
+def find_user_id():
+    """Find the most recently used Steam3 user ID."""
+    ud = STEAM_ROOT / "userdata"
+    if not ud.exists():
+        sys.exit(f"error: {ud} does not exist")
+    candidates = [d for d in ud.iterdir() if d.is_dir() and d.name.isdigit()]
+    if not candidates:
+        sys.exit("error: no Steam user found in userdata/")
+    # pick the one with the newest shortcuts.vdf or localconfig.vdf
+    def mtime(d):
+        for f in ("config/shortcuts.vdf", "config/localconfig.vdf"):
+            p = d / f
+            if p.exists():
+                return p.stat().st_mtime
+        return 0
+    return max(candidates, key=mtime).name
+
+def shortcuts_path(uid=None):
+    uid = uid or find_user_id()
+    return STEAM_ROOT / "userdata" / uid / "config" / "shortcuts.vdf"
+
+def config_vdf_path():
+    return STEAM_ROOT / "config" / "config.vdf"
+
+def grid_dir(uid=None):
+    uid = uid or find_user_id()
+    d = STEAM_ROOT / "userdata" / uid / "config" / "grid"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+# ---------------------------------------------------------------------------
+# AppID computation
+# ---------------------------------------------------------------------------
+
+def compute_appid(exe: str, name: str) -> int:
+    """Compute the unsigned 32-bit shortcut AppID."""
+    raw = zlib.crc32((exe + name).encode("utf-8")) & 0xFFFFFFFF
+    return raw | 0x80000000
+
+def appid_signed(appid: int) -> int:
+    """Convert unsigned 32-bit to signed for struct packing."""
+    return appid if appid < 0x80000000 else appid - 0x100000000
+
+# ---------------------------------------------------------------------------
+# Binary VDF reader / writer
+# ---------------------------------------------------------------------------
+# Type tags in binary VDF:
+#   0x00 = subsection (dict)     -> key\x00 ... \x08
+#   0x01 = string                -> key\x00 value\x00
+#   0x02 = int32 (LE)            -> key\x00 + 4 bytes
+#   0x08 = end of current section
+
+def read_vdf_binary(data: bytes) -> OrderedDict:
+    pos = [0]  # mutable for nested closure
+
+    def read_byte():
+        b = data[pos[0]]
+        pos[0] += 1
+        return b
+
+    def read_string():
+        start = pos[0]
+        while data[pos[0]] != 0:
+            pos[0] += 1
+        s = data[start:pos[0]].decode("utf-8", errors="replace")
+        pos[0] += 1  # skip null
+        return s
+
+    def read_int32():
+        val = struct.unpack_from("<i", data, pos[0])[0]
+        pos[0] += 4
+        return val
+
+    def read_section():
+        result = OrderedDict()
+        while pos[0] < len(data):
+            typ = read_byte()
+            if typ == 0x08:  # end of section
+                break
+            key = read_string()
+            if typ == 0x00:
+                result[key] = read_section()
+            elif typ == 0x01:
+                result[key] = read_string()
+            elif typ == 0x02:
+                result[key] = read_int32()
+            else:
+                # unknown type, try to skip as string
+                result[key] = read_string()
+        return result
+
+    return read_section()
+
+
+def write_vdf_binary(obj: OrderedDict) -> bytes:
+    buf = bytearray()
+
+    def write_section(d):
+        for key, val in d.items():
+            if isinstance(val, OrderedDict) or isinstance(val, dict):
+                buf.append(0x00)
+                buf.extend(key.encode("utf-8"))
+                buf.append(0x00)
+                write_section(val)
+                buf.append(0x08)
+            elif isinstance(val, int):
+                buf.append(0x02)
+                buf.extend(key.encode("utf-8"))
+                buf.append(0x00)
+                buf.extend(struct.pack("<i", val))
+            elif isinstance(val, str):
+                buf.append(0x01)
+                buf.extend(key.encode("utf-8"))
+                buf.append(0x00)
+                buf.extend(val.encode("utf-8"))
+                buf.append(0x00)
+
+    write_section(obj)
+    buf.append(0x08)  # final end
+    return bytes(buf)
+
+# ---------------------------------------------------------------------------
+# shortcuts.vdf helpers
+# ---------------------------------------------------------------------------
+
+def load_shortcuts(path: Path) -> OrderedDict:
+    if not path.exists() or path.stat().st_size < 5:
+        return OrderedDict({"shortcuts": OrderedDict()})
+    with open(path, "rb") as f:
+        data = f.read()
+    return read_vdf_binary(data)
+
+
+def save_shortcuts(path: Path, obj: OrderedDict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # backup
+    if path.exists():
+        bak = path.with_suffix(".vdf.bak")
+        bak.write_bytes(path.read_bytes())
+    with open(path, "wb") as f:
+        f.write(write_vdf_binary(obj))
+
+
+def next_index(shortcuts_dict: OrderedDict) -> str:
+    indices = [int(k) for k in shortcuts_dict.keys() if k.isdigit()]
+    return str(max(indices) + 1) if indices else "0"
+
+
+def find_entry(shortcuts_dict, name=None, appid=None):
+    """Return (index_key, entry_dict) or (None, None)."""
+    for idx, entry in shortcuts_dict.items():
+        if not isinstance(entry, (dict, OrderedDict)):
+            continue
+        if name and entry.get("appname", entry.get("AppName", "")) == name:
+            return idx, entry
+        if appid is not None:
+            eid = entry.get("appid", 0)
+            # handle both signed int and string forms
+            if isinstance(eid, str):
+                eid = int(eid)
+            if isinstance(eid, int) and eid < 0:
+                eid = eid + 0x100000000
+            if eid == appid:
+                return idx, entry
+    return None, None
+
+# ---------------------------------------------------------------------------
+# CompatToolMapping in config.vdf (text VDF)
+# ---------------------------------------------------------------------------
+
+def set_compat_tool(appid_unsigned: int, tool_name: str):
+    """Add or update a CompatToolMapping entry in config.vdf.
+
+    This is a targeted text insertion/replacement rather than a full VDF
+    parse, because config.vdf is large and complex (nested text VDF with
+    irregular quoting).
+    """
+    path = config_vdf_path()
+    if not path.exists():
+        print(f"warning: {path} not found, skipping compat tool assignment", file=sys.stderr)
+        return False
+
+    content = path.read_text(encoding="utf-8", errors="replace")
+    appid_str = str(appid_unsigned)
+
+    # The block we want to insert/replace:
+    new_block = (
+        f'\t\t\t\t\t"{appid_str}"\n'
+        f'\t\t\t\t\t{{\n'
+        f'\t\t\t\t\t\t"name"\t\t"{tool_name}"\n'
+        f'\t\t\t\t\t\t"config"\t\t""\n'
+        f'\t\t\t\t\t\t"priority"\t\t"250"\n'
+        f'\t\t\t\t\t}}\n'
+    )
+
+    # Check if an entry already exists for this appid
+    import re
+    pattern = re.compile(
+        rf'(\s*"{appid_str}"\s*\{{[^}}]*\}})',
+        re.DOTALL
+    )
+    if pattern.search(content):
+        content = pattern.sub(new_block.rstrip(), content)
+    else:
+        # Find CompatToolMapping block and insert before its closing brace
+        ctm_pattern = re.compile(
+            r'("CompatToolMapping"\s*\{)(.*?)(\n\s*\})',
+            re.DOTALL
+        )
+        m = ctm_pattern.search(content)
+        if m:
+            replacement = m.group(1) + m.group(2) + "\n" + new_block + m.group(3)
+            content = content[:m.start()] + replacement + content[m.end():]
+        else:
+            print(f"warning: CompatToolMapping block not found in config.vdf", file=sys.stderr)
+            return False
+
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def clear_compat_tool(appid_unsigned: int) -> bool:
+    """Remove an AppID's CompatToolMapping entry so Steam runs it natively."""
+    path = config_vdf_path()
+    if not path.exists():
+        print(f"warning: {path} not found", file=sys.stderr)
+        return False
+    content = path.read_text(encoding="utf-8", errors="replace")
+    appid_str = str(appid_unsigned)
+    import re
+    # Target only the CompatToolMapping leaf block (distinguishable by "name"
+    # key inside — the app-list block uses "SizeOnDisk" instead).
+    pat = re.compile(
+        r'\t*"' + re.escape(appid_str) + r'"[ \t]*\n\t*\{[^{}]*?"name"[ \t]+"[^"]+"[^{}]*?\}[ \t]*\n',
+        re.DOTALL,
+    )
+    new, n = pat.subn('', content, count=1)
+    if n == 0:
+        return False  # nothing to remove
+    path.write_text(new, encoding="utf-8")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Grid art downloader (Steam CDN)
+# ---------------------------------------------------------------------------
+
+# Steam CDN layout for a given app:
+#   library_600x900_2x.jpg  -> portrait capsule (main library tile)
+#   library_hero.jpg        -> hero banner shown on the game detail page
+#   logo.png                -> transparent logo overlay on hero
+#   header.jpg              -> 460x215 wide capsule ("Recent games", Home)
+#
+# Non-Steam shortcut grid filenames (under userdata/<uid>/config/grid/):
+#   <appid>p.jpg            -> portrait capsule
+#   <appid>.jpg             -> wide header capsule
+#   <appid>_hero.jpg        -> hero
+#   <appid>_logo.png        -> logo
+#   <appid>_icon.png|.ico   -> icon (kept as-is if already present)
+
+_CDN = "https://cdn.akamai.steamstatic.com/steam/apps"
+
+def download_grid_art(appid_unsigned: int, steam_appid: int, grid_dir: Path) -> dict:
+    import urllib.request, urllib.error
+    grid_dir.mkdir(parents=True, exist_ok=True)
+    jobs = [
+        ("library_600x900_2x.jpg", f"{appid_unsigned}p.jpg"),
+        ("header.jpg",             f"{appid_unsigned}.jpg"),
+        ("library_hero.jpg",       f"{appid_unsigned}_hero.jpg"),
+        ("logo.png",               f"{appid_unsigned}_logo.png"),
+    ]
+    out = {}
+    for remote, local in jobs:
+        url = f"{_CDN}/{steam_appid}/{remote}"
+        target = grid_dir / local
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                target.write_bytes(resp.read())
+            out[local] = "ok"
+        except urllib.error.HTTPError as e:
+            out[local] = f"http {e.code}"
+        except Exception as e:
+            out[local] = f"err {e}"
+    return out
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args):
+    uid = find_user_id()
+    data = load_shortcuts(shortcuts_path(uid))
+    shortcuts = data.get("shortcuts", {})
+    if not shortcuts:
+        print("No non-Steam shortcuts found.")
+        return
+
+    print(f"{'Idx':<4} {'AppID':<12} {'Name':<30} {'Exe'}")
+    print("-" * 80)
+    for idx, entry in sorted(shortcuts.items(), key=lambda x: x[0]):
+        if not isinstance(entry, (dict, OrderedDict)):
+            continue
+        name = entry.get("appname", entry.get("AppName", "???"))
+        exe = entry.get("exe", entry.get("Exe", "???"))
+        aid = entry.get("appid", 0)
+        if isinstance(aid, int) and aid < 0:
+            aid = aid + 0x100000000
+        elif isinstance(aid, str):
+            aid = int(aid) if aid.isdigit() else aid
+        print(f"{idx:<4} {aid:<12} {name:<30} {exe}")
+
+
+def cmd_add(args):
+    uid = find_user_id()
+    path = shortcuts_path(uid)
+    data = load_shortcuts(path)
+    shortcuts = data.setdefault("shortcuts", OrderedDict())
+
+    exe = args.exe
+    name = args.name
+    startdir = args.startdir or str(Path(exe.strip('"')).parent)
+
+    # Ensure exe and startdir are quoted (Steam convention)
+    if not exe.startswith('"'):
+        exe = f'"{exe}"'
+    if not startdir.startswith('"'):
+        startdir = f'"{startdir}"'
+
+    appid = compute_appid(exe, name)
+
+    # Check for duplicates
+    existing_idx, _ = find_entry(shortcuts, name=name)
+    if existing_idx is not None:
+        print(f"Shortcut '{name}' already exists at index {existing_idx}. Remove it first or use a different name.")
+        sys.exit(1)
+
+    idx = next_index(shortcuts)
+
+    tags = OrderedDict()
+    if args.tags:
+        for i, tag in enumerate(args.tags.split(",")):
+            tags[str(i)] = tag.strip()
+
+    icon_path = args.icon or ""
+    if icon_path and not icon_path.startswith('"'):
+        # don't quote icon path — Steam stores it unquoted
+        pass
+
+    entry = OrderedDict()
+    entry["appid"] = appid_signed(appid)
+    entry["appname"] = name
+    entry["exe"] = exe
+    entry["StartDir"] = startdir
+    entry["icon"] = icon_path
+    entry["ShortcutPath"] = ""
+    entry["LaunchOptions"] = args.launch_options or ""
+    entry["IsHidden"] = 1 if args.hidden else 0
+    entry["AllowDesktopConfig"] = 1
+    entry["AllowOverlay"] = 1
+    entry["OpenVR"] = 0
+    entry["Devkit"] = 0
+    entry["DevkitGameID"] = ""
+    entry["LastPlayTime"] = int(time.time())
+    entry["tags"] = tags
+
+    shortcuts[idx] = entry
+    save_shortcuts(path, data)
+
+    print(f"Added shortcut:")
+    print(f"  Name:   {name}")
+    print(f"  Exe:    {exe}")
+    print(f"  AppID:  {appid}")
+    print(f"  Index:  {idx}")
+    print(f"  VDF:    {path}")
+
+    # Set compat tool if requested
+    if args.tool:
+        if set_compat_tool(appid, args.tool):
+            print(f"  Compat: {args.tool}")
+        else:
+            print(f"  Compat: FAILED (set manually in Steam > Properties > Compatibility)")
+
+    # Copy icon to grid dir if provided
+    if icon_path and os.path.exists(icon_path):
+        import shutil
+        gdir = grid_dir(uid)
+        ext = Path(icon_path).suffix or ".png"
+        dst = gdir / f"{appid}_icon{ext}"
+        shutil.copy2(icon_path, dst)
+        print(f"  Grid:   {dst}")
+
+    print(f"\nRestart Steam to see the new shortcut in your library.")
+    return appid
+
+
+def cmd_remove(args):
+    uid = find_user_id()
+    path = shortcuts_path(uid)
+    data = load_shortcuts(path)
+    shortcuts = data.get("shortcuts", OrderedDict())
+
+    appid_val = None
+    if args.appid:
+        appid_val = int(args.appid)
+
+    idx, entry = find_entry(shortcuts, name=args.name, appid=appid_val)
+    if idx is None:
+        target = args.name or args.appid
+        print(f"Shortcut not found: {target}")
+        sys.exit(1)
+
+    name = entry.get("appname", entry.get("AppName", "???"))
+    del shortcuts[idx]
+
+    # Re-index to keep sequential
+    new_shortcuts = OrderedDict()
+    for i, (_, v) in enumerate(sorted(shortcuts.items())):
+        new_shortcuts[str(i)] = v
+    data["shortcuts"] = new_shortcuts
+    save_shortcuts(path, data)
+    print(f"Removed shortcut: {name} (was index {idx})")
+    print("Restart Steam to apply.")
+
+
+def cmd_set_compat(args):
+    appid = int(args.appid)
+    tool = args.tool
+    if set_compat_tool(appid, tool):
+        print(f"Set compat tool for AppID {appid} to '{tool}'")
+        print("Restart Steam to apply.")
+    else:
+        sys.exit(1)
+
+
+def cmd_clear_compat(args):
+    appid = int(args.appid)
+    if clear_compat_tool(appid):
+        print(f"Cleared compat tool for AppID {appid}")
+        print("Restart Steam to apply.")
+    else:
+        print(f"No compat tool mapping found for AppID {appid}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_grid(args):
+    appid = int(args.appid)
+    steam_appid = int(args.steam_appid)
+    uid = find_user_id()
+    grid_dir = STEAM_ROOT / "userdata" / str(uid) / "config" / "grid"
+    results = download_grid_art(appid, steam_appid, grid_dir)
+    for name, status in results.items():
+        print(f"  {status:<10}  {grid_dir / name}")
+    ok = sum(1 for s in results.values() if s == "ok")
+    print(f"{ok}/{len(results)} images downloaded.")
+    if ok == 0:
+        sys.exit(1)
+
+
+def cmd_appid(args):
+    exe = args.exe
+    name = args.name
+    if not exe.startswith('"'):
+        exe = f'"{exe}"'
+    appid = compute_appid(exe, name)
+    print(appid)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage Steam non-Steam game shortcuts from the CLI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="List all non-Steam shortcuts")
+
+    p_add = sub.add_parser("add", help="Add a new shortcut")
+    p_add.add_argument("--name", required=True, help="Display name")
+    p_add.add_argument("--exe", required=True, help="Target executable path")
+    p_add.add_argument("--startdir", help="Working directory")
+    p_add.add_argument("--icon", help="Icon file path")
+    p_add.add_argument("--launch-options", help="Launch options string")
+    p_add.add_argument("--tags", help="Comma-separated tags")
+    p_add.add_argument("--hidden", action="store_true", help="Mark hidden")
+    p_add.add_argument("--tool", help="Proton compat tool (e.g. proton_10)")
+
+    p_rm = sub.add_parser("remove", help="Remove a shortcut")
+    p_rm.add_argument("--name", help="Shortcut name to remove")
+    p_rm.add_argument("--appid", help="AppID to remove")
+
+    p_ct = sub.add_parser("set-compat", help="Set Proton compat tool for an AppID")
+    p_ct.add_argument("--appid", required=True, help="AppID")
+    p_ct.add_argument("--tool", required=True, help="Tool name (e.g. proton_10)")
+
+    p_cc = sub.add_parser("clear-compat",
+                          help="Remove Proton compat tool mapping (for native binaries)")
+    p_cc.add_argument("--appid", required=True, help="AppID")
+
+    p_gr = sub.add_parser("grid",
+                          help="Download official library art from Steam CDN")
+    p_gr.add_argument("--appid", required=True, help="Non-Steam shortcut AppID")
+    p_gr.add_argument("--steam-appid", required=True,
+                      help="Steam AppID of the same game (source of art)")
+
+    p_id = sub.add_parser("appid", help="Compute AppID for a name+exe pair")
+    p_id.add_argument("--name", required=True)
+    p_id.add_argument("--exe", required=True)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    {"list": cmd_list, "add": cmd_add, "remove": cmd_remove,
+     "clear-compat": cmd_clear_compat, "grid": cmd_grid,
+     "set-compat": cmd_set_compat, "appid": cmd_appid}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

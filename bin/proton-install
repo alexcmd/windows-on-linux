@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# proton-install — Download and manage Proton versions for Steam.
+#
+# Downloads Proton-GE (GloriousEggroll community builds) or lists
+# the official Proton versions already installed via Steam.
+#
+# Usage:
+#   proton-install list                    List installed Proton versions
+#   proton-install available [--all]       Show downloadable Proton-GE releases
+#   proton-install get [VERSION]           Download & install a Proton-GE version
+#                                          (latest if VERSION omitted)
+#   proton-install system [VERSION]        Install Proton via the system package
+#                                          manager; falls back to Proton-GE if
+#                                          the package is not in the repos or
+#                                          the install fails for any reason.
+#                                          VERSION is passed to the GE fallback.
+#   proton-install remove VERSION          Remove an installed Proton-GE version
+#   proton-install path VERSION            Print the install path of a version
+#
+# Proton-GE installs to: ~/.local/share/Steam/compatibilitytools.d/
+# Official Proton lives in: ~/.local/share/Steam/steamapps/common/
+#
+# After installing, restart Steam for it to appear in compatibility settings.
+#
+set -euo pipefail
+
+STEAM_ROOT="${STEAM_ROOT:-$HOME/.local/share/Steam}"
+COMPAT_DIR="$STEAM_ROOT/compatibilitytools.d"
+STEAM_COMMON="$STEAM_ROOT/steamapps/common"
+GE_API="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/proton-install"
+
+die()  { printf 'proton-install: error: %s\n' "$*" >&2; exit 1; }
+info() { printf 'proton-install: %s\n' "$*" >&2; }
+warn() { printf 'proton-install: warning: %s\n' "$*" >&2; }
+
+mkdir -p "$COMPAT_DIR" "$CACHE_DIR"
+
+# ---------------------------------------------------------------------------
+cmd_list() {
+    echo "Official Proton (Steam-managed, in $STEAM_COMMON):"
+    shopt -s nullglob
+    local found=0
+    for d in "$STEAM_COMMON/"Proton*; do
+        [ -x "$d/proton" ] && { echo "  $(basename "$d")"; found=1; }
+    done
+    [ $found -eq 0 ] && echo "  (none)"
+
+    echo
+    echo "Proton-GE / custom (in $COMPAT_DIR):"
+    found=0
+    for d in "$COMPAT_DIR"/*/; do
+        if [ -f "${d}proton" ] || [ -f "${d}proton_dist.tar.gz" ]; then
+            local name
+            name="$(basename "$d")"
+            local size
+            size=$(du -sh "$d" 2>/dev/null | cut -f1)
+            echo "  $name  ($size)"
+            found=1
+        fi
+    done
+    [ $found -eq 0 ] && echo "  (none)"
+}
+
+# ---------------------------------------------------------------------------
+cmd_available() {
+    local show_all="${1:-}"
+    local per_page=10
+    [ "$show_all" = "--all" ] && per_page=30
+
+    info "Fetching releases from GloriousEggroll/proton-ge-custom..."
+    local json
+    json=$(curl -sL "${GE_API}?per_page=${per_page}") || die "Failed to fetch releases"
+
+    echo "Available Proton-GE releases:"
+    echo "$json" | python3 -c "
+import json, sys
+releases = json.load(sys.stdin)
+for r in releases:
+    tag = r.get('tag_name', '???')
+    date = r.get('published_at', '')[:10]
+    size = ''
+    for a in r.get('assets', []):
+        if a['name'].endswith('.tar.gz') and 'sha512sum' not in a['name']:
+            mb = a.get('size', 0) / 1048576
+            size = f'{mb:.0f} MB'
+            break
+    installed = ''
+    print(f'  {tag:<25} {date}   {size}')
+" 2>/dev/null || echo "(failed to parse JSON — check network)"
+
+    echo
+    echo "Install with:  proton-install get <VERSION>"
+    echo "Example:       proton-install get GE-Proton9-20"
+}
+
+# ---------------------------------------------------------------------------
+cmd_get() {
+    local version="${1:-latest}"
+
+    info "Fetching release info for: $version"
+    local url
+    if [ "$version" = "latest" ]; then
+        url="${GE_API}/latest"
+    else
+        url="${GE_API}/tags/${version}"
+    fi
+
+    local json
+    json=$(curl -sL "$url") || die "Failed to fetch release"
+
+    # Extract tag name and tarball URL
+    local tag_name tarball_url tarball_name
+    read -r tag_name tarball_url tarball_name < <(
+        echo "$json" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+tag = r.get('tag_name', '')
+for a in r.get('assets', []):
+    if a['name'].endswith('.tar.gz') and 'sha512sum' not in a['name']:
+        print(tag, a['browser_download_url'], a['name'])
+        sys.exit(0)
+print('', '', '')
+" 2>/dev/null
+    )
+
+    [ -z "$tag_name" ] && die "Could not find release: $version"
+    [ -z "$tarball_url" ] && die "No tarball found for $tag_name"
+
+    # Check if already installed
+    if [ -d "$COMPAT_DIR/$tag_name" ]; then
+        info "$tag_name is already installed at $COMPAT_DIR/$tag_name"
+        return 0
+    fi
+
+    # Download
+    local tarball="$CACHE_DIR/$tarball_name"
+    if [ -f "$tarball" ]; then
+        info "Using cached download: $tarball"
+    else
+        info "Downloading $tarball_name..."
+        curl -L --progress-bar -o "$tarball" "$tarball_url" || die "Download failed"
+    fi
+
+    # Extract
+    info "Extracting to $COMPAT_DIR/..."
+    tar -xzf "$tarball" -C "$COMPAT_DIR" || die "Extraction failed"
+
+    # Verify
+    if [ -d "$COMPAT_DIR/$tag_name" ]; then
+        info "Installed: $tag_name"
+        info "Path:      $COMPAT_DIR/$tag_name"
+        info "Restart Steam to see it in Compatibility settings."
+    else
+        # Some releases extract to a slightly different name
+        local extracted
+        extracted=$(ls -td "$COMPAT_DIR"/*/ 2>/dev/null | head -1)
+        info "Installed: $(basename "$extracted")"
+        info "Path:      $extracted"
+        info "Restart Steam to see it in Compatibility settings."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+cmd_remove() {
+    local version="${1:?Usage: proton-install remove VERSION}"
+    local target="$COMPAT_DIR/$version"
+
+    [ -d "$target" ] || die "Not found: $target"
+
+    local size
+    size=$(du -sh "$target" 2>/dev/null | cut -f1)
+    info "Removing $version ($size)..."
+    rm -rf "$target"
+    info "Removed. Restart Steam to update."
+
+    # Also clean cached tarball
+    rm -f "$CACHE_DIR"/"$version"*.tar.gz 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+cmd_path() {
+    local version="${1:?Usage: proton-install path VERSION}"
+
+    # Check custom dir first
+    if [ -d "$COMPAT_DIR/$version" ]; then
+        echo "$COMPAT_DIR/$version"
+        return 0
+    fi
+
+    # Check Steam common
+    if [ -d "$STEAM_COMMON/$version" ]; then
+        echo "$STEAM_COMMON/$version"
+        return 0
+    fi
+
+    # Fuzzy match
+    shopt -s nullglob
+    for d in "$COMPAT_DIR"/*"$version"* "$STEAM_COMMON"/*"$version"*; do
+        if [ -d "$d" ] && { [ -x "$d/proton" ] || [ -f "$d/proton" ]; }; then
+            echo "$d"
+            return 0
+        fi
+    done
+
+    die "Proton version not found: $version"
+}
+
+# ---------------------------------------------------------------------------
+# Package-manager detection + system install
+# ---------------------------------------------------------------------------
+
+# Prints the first found package manager command, or empty string if none.
+detect_pm() {
+    local pm
+    for pm in pacman apt-get dnf zypper yum emerge; do
+        command -v "$pm" >/dev/null 2>&1 && { printf '%s' "$pm"; return 0; }
+    done
+    return 0
+}
+
+# Returns 0 when running on SteamOS (read-only root by default).
+is_steamos() {
+    command -v steamos-readonly >/dev/null 2>&1 && return 0
+    grep -qiE 'steamos|holo' /etc/os-release 2>/dev/null && return 0
+    return 1
+}
+
+# Prints the distro package name for Proton for a given package manager,
+# or empty string if the distro is not known to ship a Proton package.
+pm_proton_package() {
+    case "$1" in
+        pacman)  printf 'proton';;              # Arch extra, Manjaro, SteamOS
+        apt-get) printf 'proton';;              # Ubuntu (steam PPA) / Debian
+        dnf)     printf 'proton';;              # Fedora (RPM Fusion nonfree)
+        zypper)  printf 'proton';;              # openSUSE Games repo
+        emerge)  printf 'games-util/proton';;   # Gentoo GURU overlay
+        yum)     printf '';;                    # RHEL/CentOS: not in default repos
+        *)       printf '';;
+    esac
+}
+
+# Returns 0 if a package is found in the configured repos (no install).
+pm_pkg_exists() {
+    local pm="$1" pkg="$2"
+    case "$pm" in
+        pacman)  pacman -Si "$pkg" >/dev/null 2>&1;;
+        apt-get) apt-cache show "$pkg" >/dev/null 2>&1;;
+        dnf)     dnf info "$pkg" >/dev/null 2>&1;;
+        zypper)  zypper info "$pkg" >/dev/null 2>&1;;
+        emerge)  emerge --pretend "$pkg" >/dev/null 2>&1;;
+        *)       return 1;;
+    esac
+}
+
+# Install a package via the detected package manager.
+# Uses sudo when not already root; returns non-zero on any failure.
+pm_install() {
+    local pm="$1" pkg="$2"
+    local run=()
+
+    if [ "$(id -u)" != "0" ]; then
+        command -v sudo >/dev/null 2>&1 || { warn "sudo not found; cannot install as root"; return 1; }
+        run=(sudo)
+    fi
+
+    case "$pm" in
+        pacman)  "${run[@]}" pacman --noconfirm -S "$pkg";;
+        apt-get) "${run[@]}" apt-get install -y "$pkg";;
+        dnf)     "${run[@]}" dnf install -y "$pkg";;
+        zypper)  "${run[@]}" zypper install -y "$pkg";;
+        emerge)  "${run[@]}" emerge --ask=n "$pkg";;
+        *)       return 1;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+cmd_system() {
+    local fallback_version="${1:-latest}"
+
+    # --- detect ---------------------------------------------------------------
+    local pm
+    pm=$(detect_pm)
+
+    if [ -z "$pm" ]; then
+        warn "No supported package manager found (tried: pacman apt-get dnf zypper yum emerge)."
+        info "Falling back to Proton-GE from GitHub..."
+        cmd_get "$fallback_version"
+        return
+    fi
+
+    info "Detected package manager: $pm"
+
+    # --- SteamOS: read-only rootfs warning -----------------------------------
+    local steamos_unlocked=0
+    if is_steamos; then
+        warn "SteamOS detected. Package installs to the root filesystem are wiped on OS updates."
+        warn "Proton-GE (installed to compatibilitytools.d) survives updates and is recommended."
+        printf 'proton-install: Continue with %s anyway? [y/N] ' "$pm"
+        local ans; read -r ans
+        if [[ ! "${ans:-}" =~ ^[Yy] ]]; then
+            info "Falling back to Proton-GE from GitHub..."
+            cmd_get "$fallback_version"
+            return
+        fi
+        if command -v steamos-readonly >/dev/null 2>&1; then
+            info "Disabling SteamOS read-only rootfs..."
+            sudo steamos-readonly disable
+            steamos_unlocked=1
+        fi
+    fi
+
+    # Re-enable read-only rootfs on exit (SteamOS only)
+    if [ "$steamos_unlocked" -eq 1 ]; then
+        trap 'info "Re-enabling SteamOS read-only rootfs..."; sudo steamos-readonly enable' EXIT
+    fi
+
+    # --- check repo ----------------------------------------------------------
+    local pkg
+    pkg=$(pm_proton_package "$pm")
+
+    if [ -z "$pkg" ]; then
+        warn "$pm: no known Proton package for this distribution."
+        info "Falling back to Proton-GE from GitHub..."
+        cmd_get "$fallback_version"
+        return
+    fi
+
+    info "Checking repos for '$pkg'..."
+    if ! pm_pkg_exists "$pm" "$pkg"; then
+        warn "'$pkg' not found in $pm repos."
+        info "You may need to enable an additional repo (e.g. RPM Fusion, Steam PPA, GURU overlay)."
+        info "Falling back to Proton-GE from GitHub..."
+        cmd_get "$fallback_version"
+        return
+    fi
+
+    # --- install -------------------------------------------------------------
+    info "Installing '$pkg' via $pm..."
+    if pm_install "$pm" "$pkg"; then
+        info "Installed Proton via $pm. Restart Steam to see it in Compatibility settings."
+        return 0
+    fi
+
+    # --- fallback ------------------------------------------------------------
+    warn "Package manager install failed."
+    info "Falling back to Proton-GE from GitHub..."
+    cmd_get "$fallback_version"
+}
+
+# ---------------------------------------------------------------------------
+usage() {
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0"
+}
+
+case "${1:-}" in
+    list)       cmd_list;;
+    available)  cmd_available "${2:-}";;
+    get)        cmd_get "${2:-latest}";;
+    system)     cmd_system "${2:-latest}";;
+    remove)     cmd_remove "${2:-}";;
+    path)       cmd_path "${2:-}";;
+    -h|--help)  usage;;
+    *)          usage; exit 1;;
+esac
